@@ -1,0 +1,138 @@
+services:
+  policy:
+    image: ${MW_IMAGE:-hdt-middleware:revision}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      mosquitto:
+        condition: service_started
+    environment:
+      - POSTGRES_DSN=${POSTGRES_DSN:-postgresql+psycopg2://hdt:hdt@postgres:5432/hdt}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - MQTT_HOST=${MQTT_HOST:-mosquitto}
+      - MQTT_BROKER=${MQTT_BROKER:-mosquitto}
+      - MQTT_PORT=${MQTT_PORT:-1883}
+      - ENABLE_POLICY=${ENABLE_POLICY:-true}
+      - DECISION_INTERVAL_SECONDS=${DECISION_INTERVAL_SECONDS:-2}
+      - HEARTBEAT_STALE_S=${HEARTBEAT_STALE_S:-7}
+      - CONTROL_PERIOD_S=${CONTROL_PERIOD_S:-2}
+      - ACTION_GRID_S=${ACTION_GRID_S:-1,2,4,8}
+      - AOI_MAX_S=${AOI_MAX_S:-12}
+      - ERROR_MAX_NORM=${ERROR_MAX_NORM:-0.08}
+      - COMM_BUDGET_BPS=${COMM_BUDGET_BPS:-6000}
+      - ENERGY_BUDGET_JPS=${ENERGY_BUDGET_JPS:-6}
+      - LATENCY_MAX_MS=${LATENCY_MAX_MS:-120}
+      - W_COMM=${W_COMM:-0.35}
+      - W_ENERGY=${W_ENERGY:-0.15}
+      - W_ERROR=${W_ERROR:-0.35}
+      - W_AOI=${W_AOI:-0.15}
+    command: python -m middleware.workers.decision_loop
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    # Diagnostic only: retain SQL semantics, log slow queries and long lock waits.
+    command: ["postgres", "-c", "log_min_duration_statement=250", "-c", "log_lock_waits=on", "-c", "deadlock_timeout=200ms"]
+    # container_name opcional; la resolución DNS usa el nombre del servicio "postgres"
+    # container_name: hdt-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hdt}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hdt}
+      POSTGRES_DB: ${POSTGRES_DB:-hdt}
+    ports:
+      - "127.0.0.1:${HDT_PG_PORT:-55432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Si tienes scripts de init:
+      # - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-hdt} -d $${POSTGRES_DB:-hdt}"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+    restart: unless-stopped
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports: ["127.0.0.1:${HDT_MQTT_PORT:-18883}:1883"]
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    # container_name: hdt-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # ports:
+    #   - "6379:6379" # expón solo si lo necesitas fuera de Docker
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  middleware:
+    # Usa tu imagen o build. Si construyes desde tu repo:
+    build:
+      context: .
+      dockerfile: middleware/Dockerfile
+    image: ${MW_IMAGE:-hdt-middleware:revision}
+    environment:
+      # Usar SIEMPRE el nombre del servicio "postgres" como host interno:
+      # Si ya tienes POSTGRES_DSN en .env, lo usamos; si no, fallback razonable.
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql+psycopg2://hdt:hdt@postgres:5432/hdt}
+      MQTT_BROKER: ${MQTT_BROKER:-mosquitto}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # Same DB capacity settings for all experimental policies.
+      HDT_DB_POOL_SIZE: ${HDT_DB_POOL_SIZE:-20}
+      HDT_DB_MAX_OVERFLOW: ${HDT_DB_MAX_OVERFLOW:-20}
+      HDT_DB_POOL_TIMEOUT_S: ${HDT_DB_POOL_TIMEOUT_S:-5}
+      # Añade aquí cualquier otra var que uses (SECRET_KEY, etc.)
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+      redis:
+        condition: service_started
+    ports:
+      - "127.0.0.1:${HDT_API_PORT:-18000}:8000"
+    command: uvicorn middleware.app:app --host 0.0.0.0 --port 8000
+    healthcheck:
+      # Healthcheck HTTP sin curl/wget (usa Python stdlib, presente en la imagen)
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()\" || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+      start_period: 5s
+    restart: unless-stopped
+
+  edge:
+    # Igual: imagen propia o build desde el repo
+    build:
+      context: .
+      dockerfile: agents/Dockerfile
+    image: ${EDGE_IMAGE:-hdt-edge:revision}
+    # container_name: hdt-edge
+    environment:
+      API_URL: ${API_URL:-http://middleware:8000}
+      MQTT_BROKER: ${MQTT_BROKER:-mosquitto}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # Si tus agentes usan un ID o número de nodos, puedes pasarlo:
+      # EDGE_N: ${EDGE_N:-5}
+    depends_on:
+      middleware:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  mosquitto_conf:
+  mosquitto_data:
+  mosquitto_log:
+  redis_data:
